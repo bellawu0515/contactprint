@@ -430,8 +430,9 @@ function buildContractHtml(p: {
   unitPrice: string;
   totalPrice: string;
 
-  plannedDelivery: string; // 预计交货日期
+  productRemark: string; // 产品备注（文字）
   paymentTerms: string; // 付款条件
+
 
   productImgDataUrl?: string;
 
@@ -550,7 +551,7 @@ function buildContractHtml(p: {
         <th style="width:12%;">数量（台）</th>
         <th style="width:16%;">出厂含税单价（元/台）</th>
         <th style="width:14%;">金额（元）</th>
-        <th style="width:16%;">计划交货期</th>
+        <th style="width:16%;">产品备注</th>
       </tr>
     </thead>
     <tbody>
@@ -560,14 +561,13 @@ function buildContractHtml(p: {
         <td>${escapeHtml(p.qty)}</td>
         <td>${escapeHtml(p.unitPrice)}</td>
         <td>${escapeHtml(p.totalPrice)}</td>
-        <td>具体以需方通知的出货计划为准</td>
       </tr>
     </tbody>
   </table>
 
   <div class="para">合同总价：人民币${escapeHtml(p.totalPrice)}元（大写：${escapeHtml(totalUpper)}），含13%增值税。</div>
   <div class="para">交货地点：供方指定，货物风险与损失责任在双方签收《送货单/交接单》时转移。</div>
-  <div class="para">计划交货期：${escapeHtml(p.plannedDelivery || "")}</div>
+  <div class="para">计划交货期：${escapeHtml(p.plannedDelivery || "")}，具体以需方通知的出货计划为准</div>
 
 
   ${p.productImgDataUrl ? `
@@ -771,8 +771,9 @@ export default async function handler(req: any, res: any) {
     );
     const totalPrice = fmtMoneyWithComma(pickField(fields, ["采购总价", "合同总价", "金额（元）", "金额"]) || "");
 
-    // 计划交货期：飞书里叫「预计交货日期」
-    const plannedDelivery = fmtDateCn(pickField(fields, ["预计交货日期", "计划交货期", "计划交货日期"]) || "");
+    // 产品备注：文字字段（合同台账里已有）
+    const productRemark = toText(pickField(fields, ["产品备注", "备注", "产品说明"]) || "");
+
 
     // 付款方式：飞书里叫「付款条件」
     const paymentTermsRaw = pickField(fields, ["付款条件", "付款方式", "账期"]);
@@ -837,7 +838,7 @@ export default async function handler(req: any, res: any) {
       qty,
       unitPrice,
       totalPrice,
-      plannedDelivery,
+      productRemark,
       paymentTerms,
       productImgDataUrl,
       fontCss,
