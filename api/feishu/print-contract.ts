@@ -432,6 +432,8 @@ function buildContractHtml(p: {
 
   productRemark: string; // 产品备注（文字）
   paymentTerms: string; // 付款条件
+  plannedDelivery: string;//预计交货期
+
 
 
   productImgDataUrl?: string;
