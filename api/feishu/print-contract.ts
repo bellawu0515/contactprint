@@ -2,6 +2,8 @@
 import type { IncomingMessage } from "http";
 import chromium from "@sparticuz/chromium";
 import puppeteer from "puppeteer-core";
+import path from "path";
+import fs from "fs/promises";
 
 // -------------------- helpers: read json body --------------------
 async function readJson(req: any) {
@@ -47,15 +49,25 @@ async function getTenantAccessToken() {
   return token;
 }
 
-async function feishuFetch(path: string, init?: RequestInit) {
+async function feishuFetch(pathStr: string, init?: RequestInit) {
   const token = await getTenantAccessToken();
-  const url = `https://open.feishu.cn/open-apis${path}`;
+  const url = `https://open.feishu.cn/open-apis${pathStr}`;
+
+  // init.headers 可能是 Headers/Record，统一转为 plain object
+  const extraHeaders: Record<string, any> = {};
+  if (init?.headers) {
+    if (init.headers instanceof Headers) {
+      for (const [k, v] of init.headers.entries()) extraHeaders[k] = v;
+    } else {
+      Object.assign(extraHeaders, init.headers as any);
+    }
+  }
 
   const res = await fetch(url, {
     ...init,
     headers: {
       Authorization: `Bearer ${token}`,
-      ...(init?.headers || {}),
+      ...extraHeaders,
     },
   });
 
@@ -67,10 +79,10 @@ async function feishuFetch(path: string, init?: RequestInit) {
     json = { raw: text };
   }
 
-  if (!res.ok) throw new Error(`Feishu API ${path} failed: ${res.status} ${JSON.stringify(json)}`);
+  if (!res.ok) throw new Error(`Feishu API ${pathStr} failed: ${res.status} ${JSON.stringify(json)}`);
   // 飞书也可能 200 但 code!=0
   if (json && typeof json === "object" && "code" in json && json.code) {
-    throw new Error(`Feishu API ${path} error: ${JSON.stringify(json)}`);
+    throw new Error(`Feishu API ${pathStr} error: ${JSON.stringify(json)}`);
   }
   return json;
 }
@@ -366,6 +378,106 @@ async function downloadMediaToDataUrl(fileToken: string) {
   return `data:${ct};base64,${b64}`;
 }
 
+// ==================== 字体：拉取 public/fonts 下的中文字体，注入到 HTML ====================
+let cachedFontDataUrl: { dataUrl: string; expireAt: number } | null = null;
+
+function guessFontMimeByUrl(url: string) {
+  const u = url.toLowerCase();
+  if (u.endsWith(".otf")) return "font/otf";
+  if (u.endsWith(".ttf")) return "font/ttf";
+  if (u.endsWith(".ttc")) return "font/ttf"; // ttc 也先按 ttf 处理
+  if (u.endsWith(".woff2")) return "font/woff2";
+  if (u.endsWith(".woff")) return "font/woff";
+  return "application/octet-stream";
+}
+
+async function tryFetchAsDataUrl(url: string): Promise<string | null> {
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const ab = await r.arrayBuffer();
+    const buf = Buffer.from(ab);
+    const mime = r.headers.get("content-type") || guessFontMimeByUrl(url);
+    return `data:${mime};base64,${buf.toString("base64")}`;
+  } catch {
+    return null;
+  }
+}
+
+async function tryReadFileAsDataUrl(filePath: string): Promise<string | null> {
+  try {
+    const buf = await fs.readFile(filePath);
+    const ext = path.extname(filePath).toLowerCase();
+    const mime =
+      ext === ".otf" ? "font/otf" :
+      ext === ".ttf" ? "font/ttf" :
+      ext === ".ttc" ? "font/ttf" :
+      ext === ".woff2" ? "font/woff2" :
+      ext === ".woff" ? "font/woff" :
+      "application/octet-stream";
+    return `data:${mime};base64,${buf.toString("base64")}`;
+  } catch {
+    return null;
+  }
+}
+
+async function getCjkFontDataUrl(req: any): Promise<string | undefined> {
+  const now = Date.now();
+  if (cachedFontDataUrl && cachedFontDataUrl.expireAt > now + 60_000) {
+    return cachedFontDataUrl.dataUrl;
+  }
+
+  // 允许你用环境变量直接指定字体 URL（可选）
+  const envUrl = process.env.PDF_FONT_URL;
+  const candidates: string[] = [];
+  if (envUrl) candidates.push(envUrl);
+
+  // 组一个当前站点 baseUrl，用 /fonts/... 走静态资源
+  const proto =
+    (req.headers["x-forwarded-proto"] as string) ||
+    (req.headers["X-Forwarded-Proto"] as string) ||
+    "https";
+  const host =
+    (req.headers["x-forwarded-host"] as string) ||
+    (req.headers["X-Forwarded-Host"] as string) ||
+    req.headers.host;
+
+  if (host) {
+    const baseUrl = `${proto}://${host}`;
+    candidates.push(
+      `${baseUrl}/fonts/NotoSansSC-Regular.otf`,
+      `${baseUrl}/fonts/NotoSansSC-Regular.ttf`,
+      `${baseUrl}/fonts/NotoSansCJK-Regular.ttc`
+    );
+  }
+
+  // 1) 先尝试 HTTP 拉取（最稳：不依赖 includeFiles）
+  for (const url of candidates) {
+    const dataUrl = await tryFetchAsDataUrl(url);
+    if (dataUrl) {
+      cachedFontDataUrl = { dataUrl, expireAt: now + 6 * 60 * 60 * 1000 };
+      return dataUrl;
+    }
+  }
+
+  // 2) 再尝试本地读 public/fonts（本地开发或函数打包带入时可用）
+  const localCandidates = [
+    path.join(process.cwd(), "public", "fonts", "NotoSansSC-Regular.otf"),
+    path.join(process.cwd(), "public", "fonts", "NotoSansSC-Regular.ttf"),
+    path.join(process.cwd(), "public", "fonts", "NotoSansCJK-Regular.ttc"),
+  ];
+
+  for (const fp of localCandidates) {
+    const dataUrl = await tryReadFileAsDataUrl(fp);
+    if (dataUrl) {
+      cachedFontDataUrl = { dataUrl, expireAt: now + 6 * 60 * 60 * 1000 };
+      return dataUrl;
+    }
+  }
+
+  return undefined;
+}
+
 // -------------------- build contract html --------------------
 function buildContractHtml(p: {
   contractNo: string;
@@ -391,11 +503,24 @@ function buildContractHtml(p: {
   paymentTerms: string; // 付款条件
 
   productImgDataUrl?: string;
+
+  // ✅ 新增：字体 dataUrl（不影响合同正文内容）
+  fontDataUrl?: string;
 }) {
   const totalNum = num(p.totalPrice);
   const totalUpper = totalNum ? rmbUppercase(totalNum) : "";
 
   const spec = p.sku ? `${p.sku}（详见附件技术要求）` : `（详见附件技术要求）`;
+
+  const fontFaceCss = p.fontDataUrl
+    ? `
+    @font-face{
+      font-family:"ContractCJK";
+      src:url("${p.fontDataUrl}");
+      font-weight:normal;
+      font-style:normal;
+    }`
+    : ``;
 
   return `<!doctype html>
 <html lang="zh-CN">
@@ -403,9 +528,10 @@ function buildContractHtml(p: {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
+    ${fontFaceCss}
     *{ box-sizing:border-box; }
     body{
-      font-family:"PingFang SC","Microsoft YaHei",Arial,sans-serif;
+      font-family:${p.fontDataUrl ? `"ContractCJK",` : ""}"PingFang SC","Microsoft YaHei",Arial,sans-serif;
       color:#000;
       margin:0;
       padding:24px 26px;
@@ -584,8 +710,7 @@ function buildContractHtml(p: {
 
 // -------------------- html -> pdf buffer --------------------
 async function getLaunchOptions() {
-  const isVercel =
-    !!process.env.VERCEL || !!process.env.AWS_LAMBDA_FUNCTION_VERSION;
+  const isVercel = !!process.env.VERCEL || !!process.env.AWS_LAMBDA_FUNCTION_VERSION;
 
   if (isVercel) {
     return {
@@ -596,19 +721,15 @@ async function getLaunchOptions() {
   }
 
   // 本地（Mac）
-  const macChrome =
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+  const macChrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 
   return {
     args: ["--no-sandbox", "--disable-setuid-sandbox"],
     executablePath:
-      process.env.PUPPETEER_EXECUTABLE_PATH ||
-      (process.platform === "darwin" ? macChrome : undefined),
+      process.env.PUPPETEER_EXECUTABLE_PATH || (process.platform === "darwin" ? macChrome : undefined),
     headless: true,
   };
 }
-
-
 
 async function htmlToPdfBuffer(html: string) {
   const launchOpt = await getLaunchOptions();
@@ -618,8 +739,10 @@ async function htmlToPdfBuffer(html: string) {
     const page = await browser.newPage();
     page.setDefaultNavigationTimeout(60_000);
 
-    await page.setContent(html, { waitUntil: "domcontentloaded" });
-    await new Promise((r) => setTimeout(r, 300)); // 等图片渲染
+    // ✅ networkidle0 + 等字体 ready
+    await page.setContent(html, { waitUntil: "networkidle0" });
+    await page.evaluateHandle("document.fonts.ready");
+    await new Promise((r) => setTimeout(r, 200)); // 再缓冲一下，确保排版稳定
 
     const pdf = await page.pdf({
       format: "A4",
@@ -693,6 +816,9 @@ export default async function handler(req: any, res: any) {
     const signPlace = process.env.SIGN_PLACE || "临安";
 
     if (!appToken || !tableId) throw new Error("Missing FEISHU_APP_TOKEN / FEISHU_CONTRACT_TABLE_ID");
+
+    // ✅ 关键：先拿中文字体 dataUrl（没拿到也不阻断，只是会退回系统字体）
+    const fontDataUrl = await getCjkFontDataUrl(req);
 
     // 1) 拉取合同记录
     const rec = await feishuFetch(
@@ -786,6 +912,7 @@ export default async function handler(req: any, res: any) {
       plannedDelivery,
       paymentTerms,
       productImgDataUrl,
+      fontDataUrl, // ✅ 注入字体
     });
 
     const pdf = await htmlToPdfBuffer(html);
