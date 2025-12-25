@@ -584,31 +584,31 @@ function buildContractHtml(p: {
 
 // -------------------- html -> pdf buffer --------------------
 async function getLaunchOptions() {
-  const isVercel = !!process.env.VERCEL || !!process.env.AWS_LAMBDA_FUNCTION_VERSION;
+  const isVercel =
+    !!process.env.VERCEL || !!process.env.AWS_LAMBDA_FUNCTION_VERSION;
 
   if (isVercel) {
-    const executablePath = await chromium.executablePath();
     return {
       args: chromium.args,
-      defaultViewport: chromium.defaultViewport,
-      executablePath,
-      headless: chromium.headless,
+      executablePath: await chromium.executablePath(),
+      headless: true,
     };
   }
 
-  // 本地（尤其 Mac）：用本机 Chrome，避免 @sparticuz/chromium 的 Linux binary 报 ENOEXEC
-  const macChrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-  const executablePath =
-    process.env.PUPPETEER_EXECUTABLE_PATH ||
-    (process.platform === "darwin" ? macChrome : undefined);
+  // 本地（Mac）
+  const macChrome =
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 
   return {
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-    defaultViewport: { width: 1240, height: 1754 },
-    executablePath,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    executablePath:
+      process.env.PUPPETEER_EXECUTABLE_PATH ||
+      (process.platform === "darwin" ? macChrome : undefined),
     headless: true,
   };
 }
+
+
 
 async function htmlToPdfBuffer(html: string) {
   const launchOpt = await getLaunchOptions();

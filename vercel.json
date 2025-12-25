@@ -1,5 +1,10 @@
 {
   "functions": {
+    "api/feishu/print-contract.ts": {
+      "runtime": "nodejs18.x",
+      "maxDuration": 60,
+      "memory": 1024
+    },
     "api/**/*.ts": {
       "runtime": "nodejs18.x"
     }
