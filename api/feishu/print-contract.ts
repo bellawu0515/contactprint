@@ -430,11 +430,9 @@ function buildContractHtml(p: {
   unitPrice: string;
   totalPrice: string;
 
+  plannedDelivery: string; // ✅预计交货期（来自“预计交货日期”）
   productRemark: string; // 产品备注（文字）
   paymentTerms: string; // 付款条件
-  plannedDelivery: string;//预计交货期
-
-
 
   productImgDataUrl?: string;
 
@@ -445,6 +443,11 @@ function buildContractHtml(p: {
   const totalUpper = totalNum ? rmbUppercase(totalNum) : "";
 
   const spec = p.sku ? `${p.sku}（详见附件技术要求）` : `（详见附件技术要求）`;
+
+  // ✅计划交货期：为空时不输出 “：,”
+  const plannedDeliveryLine = p.plannedDelivery
+    ? `计划交货期：${escapeHtml(p.plannedDelivery)}，具体以需方通知的出货计划为准`
+    : `计划交货期：具体以需方通知的出货计划为准`;
 
   return `<!doctype html>
 <html lang="zh-CN">
@@ -568,10 +571,8 @@ function buildContractHtml(p: {
 
   <div class="para">合同总价：人民币${escapeHtml(p.totalPrice)}元（大写：${escapeHtml(totalUpper)}），含13%增值税。</div>
   <div class="para">交货地点：供方指定，货物风险与损失责任在双方签收《送货单/交接单》时转移。</div>
-  <div class="para">计划交货期：${escapeHtml(p.plannedDelivery || "")}，具体以需方通知的出货计划为准</div>
+  <div class="para">${plannedDeliveryLine}</div>
   <div class="para">产品备注：${escapeHtml(p.productRemark)}</div>
-
-
 
   ${p.productImgDataUrl ? `
     <div class="imgbox">
@@ -758,7 +759,7 @@ export default async function handler(req: any, res: any) {
     const fields = rec?.data?.record?.fields || {};
 
     // 合同台账字段映射（你可按真实字段名加/改）
-    const contractNo = toText(pickField(fields, ["合同号"]) || "");
+    const contractNo = toText(pickField(fields, ["合同号", "合同编号"]) || "");
     const sku = toText(pickField(fields, ["产品SKU", "SKU", "型号/规格"]) || "");
     const productName = toText(pickField(fields, ["产品名称", "品名"]) || "");
 
@@ -774,9 +775,12 @@ export default async function handler(req: any, res: any) {
     );
     const totalPrice = fmtMoneyWithComma(pickField(fields, ["采购总价", "合同总价", "金额（元）", "金额"]) || "");
 
+    // ✅计划交货期（合同台账字段：预计交货日期）
+    const plannedDeliveryRaw = pickField(fields, ["预计交货日期"]);
+    const plannedDelivery = plannedDeliveryRaw ? fmtDateCn(plannedDeliveryRaw) : "";
+
     // 产品备注：文字字段（合同台账里已有）
     const productRemark = toText(pickField(fields, ["产品备注", "备注", "产品说明"]) || "");
-
 
     // 付款方式：飞书里叫「付款条件」
     const paymentTermsRaw = pickField(fields, ["付款条件", "付款方式", "账期"]);
@@ -841,6 +845,7 @@ export default async function handler(req: any, res: any) {
       qty,
       unitPrice,
       totalPrice,
+      plannedDelivery, // ✅一定要传
       productRemark,
       paymentTerms,
       productImgDataUrl,
