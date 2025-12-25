@@ -1,9 +1,9 @@
 // api/feishu/print-contract.ts
 import type { IncomingMessage } from "http";
+import fs from "fs";
+import path from "path";
 import chromium from "@sparticuz/chromium";
 import puppeteer from "puppeteer-core";
-import path from "path";
-import fs from "fs/promises";
 
 // -------------------- helpers: read json body --------------------
 async function readJson(req: any) {
@@ -49,25 +49,15 @@ async function getTenantAccessToken() {
   return token;
 }
 
-async function feishuFetch(pathStr: string, init?: RequestInit) {
+async function feishuFetch(path0: string, init?: RequestInit) {
   const token = await getTenantAccessToken();
-  const url = `https://open.feishu.cn/open-apis${pathStr}`;
-
-  // init.headers 可能是 Headers/Record，统一转为 plain object
-  const extraHeaders: Record<string, any> = {};
-  if (init?.headers) {
-    if (init.headers instanceof Headers) {
-      for (const [k, v] of init.headers.entries()) extraHeaders[k] = v;
-    } else {
-      Object.assign(extraHeaders, init.headers as any);
-    }
-  }
+  const url = `https://open.feishu.cn/open-apis${path0}`;
 
   const res = await fetch(url, {
     ...init,
     headers: {
       Authorization: `Bearer ${token}`,
-      ...extraHeaders,
+      ...(init?.headers || {}),
     },
   });
 
@@ -79,10 +69,10 @@ async function feishuFetch(pathStr: string, init?: RequestInit) {
     json = { raw: text };
   }
 
-  if (!res.ok) throw new Error(`Feishu API ${pathStr} failed: ${res.status} ${JSON.stringify(json)}`);
+  if (!res.ok) throw new Error(`Feishu API ${path0} failed: ${res.status} ${JSON.stringify(json)}`);
   // 飞书也可能 200 但 code!=0
   if (json && typeof json === "object" && "code" in json && json.code) {
-    throw new Error(`Feishu API ${pathStr} error: ${JSON.stringify(json)}`);
+    throw new Error(`Feishu API ${path0} error: ${JSON.stringify(json)}`);
   }
   return json;
 }
@@ -378,104 +368,45 @@ async function downloadMediaToDataUrl(fileToken: string) {
   return `data:${ct};base64,${b64}`;
 }
 
-// ==================== 字体：拉取 public/fonts 下的中文字体，注入到 HTML ====================
-let cachedFontDataUrl: { dataUrl: string; expireAt: number } | null = null;
+// ==================== Font embedding (解决 PDF 中文乱码) ====================
+let cachedFontCss: string | null = null;
 
-function guessFontMimeByUrl(url: string) {
-  const u = url.toLowerCase();
-  if (u.endsWith(".otf")) return "font/otf";
-  if (u.endsWith(".ttf")) return "font/ttf";
-  if (u.endsWith(".ttc")) return "font/ttf"; // ttc 也先按 ttf 处理
-  if (u.endsWith(".woff2")) return "font/woff2";
-  if (u.endsWith(".woff")) return "font/woff";
-  return "application/octet-stream";
+function fileToDataUrl(relPath: string, mime: string) {
+  const abs = path.join(process.cwd(), relPath);
+  const buf = fs.readFileSync(abs);
+  const b64 = buf.toString("base64");
+  return `data:${mime};base64,${b64}`;
 }
 
-async function tryFetchAsDataUrl(url: string): Promise<string | null> {
-  try {
-    const r = await fetch(url);
-    if (!r.ok) return null;
-    const ab = await r.arrayBuffer();
-    const buf = Buffer.from(ab);
-    const mime = r.headers.get("content-type") || guessFontMimeByUrl(url);
-    return `data:${mime};base64,${buf.toString("base64")}`;
-  } catch {
-    return null;
-  }
-}
+function getEmbeddedFontCss() {
+  if (cachedFontCss) return cachedFontCss;
 
-async function tryReadFileAsDataUrl(filePath: string): Promise<string | null> {
-  try {
-    const buf = await fs.readFile(filePath);
-    const ext = path.extname(filePath).toLowerCase();
-    const mime =
-      ext === ".otf" ? "font/otf" :
-      ext === ".ttf" ? "font/ttf" :
-      ext === ".ttc" ? "font/ttf" :
-      ext === ".woff2" ? "font/woff2" :
-      ext === ".woff" ? "font/woff" :
-      "application/octet-stream";
-    return `data:${mime};base64,${buf.toString("base64")}`;
-  } catch {
-    return null;
-  }
-}
+  // 你当前目录：public/fonts/
+  const regularRel = "public/fonts/NotoSansSC-Regular.ttf";
+  const boldRel = "public/fonts/NotoSansSC-Bold.ttf";
 
-async function getCjkFontDataUrl(req: any): Promise<string | undefined> {
-  const now = Date.now();
-  if (cachedFontDataUrl && cachedFontDataUrl.expireAt > now + 60_000) {
-    return cachedFontDataUrl.dataUrl;
-  }
+  // 注意：ttf 的 mime 用 font/ttf
+  const regularDataUrl = fileToDataUrl(regularRel, "font/ttf");
+  const boldDataUrl = fileToDataUrl(boldRel, "font/ttf");
 
-  // 允许你用环境变量直接指定字体 URL（可选）
-  const envUrl = process.env.PDF_FONT_URL;
-  const candidates: string[] = [];
-  if (envUrl) candidates.push(envUrl);
-
-  // 组一个当前站点 baseUrl，用 /fonts/... 走静态资源
-  const proto =
-    (req.headers["x-forwarded-proto"] as string) ||
-    (req.headers["X-Forwarded-Proto"] as string) ||
-    "https";
-  const host =
-    (req.headers["x-forwarded-host"] as string) ||
-    (req.headers["X-Forwarded-Host"] as string) ||
-    req.headers.host;
-
-  if (host) {
-    const baseUrl = `${proto}://${host}`;
-    candidates.push(
-      `${baseUrl}/fonts/NotoSansSC-Regular.otf`,
-      `${baseUrl}/fonts/NotoSansSC-Regular.ttf`,
-      `${baseUrl}/fonts/NotoSansCJK-Regular.ttc`
-    );
-  }
-
-  // 1) 先尝试 HTTP 拉取（最稳：不依赖 includeFiles）
-  for (const url of candidates) {
-    const dataUrl = await tryFetchAsDataUrl(url);
-    if (dataUrl) {
-      cachedFontDataUrl = { dataUrl, expireAt: now + 6 * 60 * 60 * 1000 };
-      return dataUrl;
+  cachedFontCss = `
+    @font-face{
+      font-family:"NotoSansSC";
+      src:url("${regularDataUrl}") format("truetype");
+      font-weight:400;
+      font-style:normal;
+      font-display:swap;
     }
-  }
-
-  // 2) 再尝试本地读 public/fonts（本地开发或函数打包带入时可用）
-  const localCandidates = [
-    path.join(process.cwd(), "public", "fonts", "NotoSansSC-Regular.otf"),
-    path.join(process.cwd(), "public", "fonts", "NotoSansSC-Regular.ttf"),
-    path.join(process.cwd(), "public", "fonts", "NotoSansCJK-Regular.ttc"),
-  ];
-
-  for (const fp of localCandidates) {
-    const dataUrl = await tryReadFileAsDataUrl(fp);
-    if (dataUrl) {
-      cachedFontDataUrl = { dataUrl, expireAt: now + 6 * 60 * 60 * 1000 };
-      return dataUrl;
+    @font-face{
+      font-family:"NotoSansSC";
+      src:url("${boldDataUrl}") format("truetype");
+      font-weight:700;
+      font-style:normal;
+      font-display:swap;
     }
-  }
+  `.trim();
 
-  return undefined;
+  return cachedFontCss;
 }
 
 // -------------------- build contract html --------------------
@@ -504,23 +435,13 @@ function buildContractHtml(p: {
 
   productImgDataUrl?: string;
 
-  // ✅ 新增：字体 dataUrl（不影响合同正文内容）
-  fontDataUrl?: string;
+  // 字体 CSS（注入 @font-face）
+  fontCss?: string;
 }) {
   const totalNum = num(p.totalPrice);
   const totalUpper = totalNum ? rmbUppercase(totalNum) : "";
 
   const spec = p.sku ? `${p.sku}（详见附件技术要求）` : `（详见附件技术要求）`;
-
-  const fontFaceCss = p.fontDataUrl
-    ? `
-    @font-face{
-      font-family:"ContractCJK";
-      src:url("${p.fontDataUrl}");
-      font-weight:normal;
-      font-style:normal;
-    }`
-    : ``;
 
   return `<!doctype html>
 <html lang="zh-CN">
@@ -528,10 +449,11 @@ function buildContractHtml(p: {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    ${fontFaceCss}
+    ${p.fontCss || ""}
+
     *{ box-sizing:border-box; }
     body{
-      font-family:${p.fontDataUrl ? `"ContractCJK",` : ""}"PingFang SC","Microsoft YaHei",Arial,sans-serif;
+      font-family:"NotoSansSC","PingFang SC","Microsoft YaHei",Arial,sans-serif;
       color:#000;
       margin:0;
       padding:24px 26px;
@@ -671,7 +593,7 @@ function buildContractHtml(p: {
   <div class="section-title">三、交货、结算与票据</div>
   <div class="para">3.1 交货期：供方应按需方书面分批计划出货。供方不得以内部物料准备、打样、模具等原因单方延迟。</div>
   <div class="para">3.2 发票与单据：供方须于发货后10个工作日内开具合法有效的13%增值税专用发票。增值税发票/送货单/合同信息必须一致（品名、型号、数量、双方抬头等）。</div>
-  <div class="para">3.3 生产过程信息：供方应按需方要求提供生产过程关键节点照片/视频，便于需方抽查确认。</div>
+  <div class="para">3.3 生产过程信息：供方提供生产过程关键节点照片/视频，便于需方抽查确认。</div>
 
   <div class="section-title">四、双方责任与违约处理</div>
   <div class="para">4.1 供方责任：按时、按质、按量交货；承担因质量问题、配件缺失、贴标错误等引起的直接损失及可预见的合理间接损失（以需方提供凭证为准）。</div>
@@ -725,8 +647,7 @@ async function getLaunchOptions() {
 
   return {
     args: ["--no-sandbox", "--disable-setuid-sandbox"],
-    executablePath:
-      process.env.PUPPETEER_EXECUTABLE_PATH || (process.platform === "darwin" ? macChrome : undefined),
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || (process.platform === "darwin" ? macChrome : undefined),
     headless: true,
   };
 }
@@ -739,10 +660,18 @@ async function htmlToPdfBuffer(html: string) {
     const page = await browser.newPage();
     page.setDefaultNavigationTimeout(60_000);
 
-    // ✅ networkidle0 + 等字体 ready
-    await page.setContent(html, { waitUntil: "networkidle0" });
-    await page.evaluateHandle("document.fonts.ready");
-    await new Promise((r) => setTimeout(r, 200)); // 再缓冲一下，确保排版稳定
+    await page.setContent(html, { waitUntil: "domcontentloaded" });
+
+    // 关键：等字体加载完（否则中文容易空白/乱码）
+    await page.evaluate(async () => {
+      // @ts-ignore
+      if (document.fonts && document.fonts.ready) {
+        // @ts-ignore
+        await document.fonts.ready;
+      }
+    });
+
+    await new Promise((r) => setTimeout(r, 200)); // 再给一点渲染缓冲
 
     const pdf = await page.pdf({
       format: "A4",
@@ -793,7 +722,7 @@ export default async function handler(req: any, res: any) {
     // 简单鉴权：防止别人乱打你接口
     const token = process.env.WEBHOOK_TOKEN;
     if (token) {
-      const got = (req.headers["x-webhook-token"] || req.headers["X-Webhook-Token"]) as string | undefined;
+      const got = (req.headers["x-webhook-token"] as string | undefined) || (req.headers["X-Webhook-Token"] as any);
       if (got !== token) {
         res.status(401).json({ ok: false, error: "Unauthorized" });
         return;
@@ -816,9 +745,6 @@ export default async function handler(req: any, res: any) {
     const signPlace = process.env.SIGN_PLACE || "临安";
 
     if (!appToken || !tableId) throw new Error("Missing FEISHU_APP_TOKEN / FEISHU_CONTRACT_TABLE_ID");
-
-    // ✅ 关键：先拿中文字体 dataUrl（没拿到也不阻断，只是会退回系统字体）
-    const fontDataUrl = await getCjkFontDataUrl(req);
 
     // 1) 拉取合同记录
     const rec = await feishuFetch(
@@ -865,10 +791,9 @@ export default async function handler(req: any, res: any) {
     const signDate = signDateRaw ? fmtDateCn(signDateRaw) : fmtDateCn(Date.now());
 
     // ===================== 产品图（查找引用来自 SKU 主档） =====================
-    // 合同台账里一般会有一个查找引用字段，名字可能就是「产品图」
     const contractImageField = process.env.FEISHU_PRODUCT_IMAGE_FIELD || "产品图";
-    const skuLinkField = process.env.FEISHU_SKU_LINK_FIELD || "SKU"; // 你说字段名是 SKU
-    const skuImageField = process.env.FEISHU_SKU_IMAGE_FIELD || "产品图"; // SKU 主档里叫 产品图
+    const skuLinkField = process.env.FEISHU_SKU_LINK_FIELD || "SKU";
+    const skuImageField = process.env.FEISHU_SKU_IMAGE_FIELD || "产品图";
 
     const imgVal = pickField(fields, [contractImageField, "产品图片", "产品主图", "参考图", "图片"]);
     let imgToken = pickFileToken(imgVal);
@@ -893,6 +818,9 @@ export default async function handler(req: any, res: any) {
       productImgDataUrl = await downloadMediaToDataUrl(imgToken);
     }
 
+    // 关键：注入字体（解决中文乱码/空白）
+    const fontCss = getEmbeddedFontCss();
+
     // 2) 生成 PDF
     const html = buildContractHtml({
       contractNo,
@@ -912,7 +840,7 @@ export default async function handler(req: any, res: any) {
       plannedDelivery,
       paymentTerms,
       productImgDataUrl,
-      fontDataUrl, // ✅ 注入字体
+      fontCss,
     });
 
     const pdf = await htmlToPdfBuffer(html);
