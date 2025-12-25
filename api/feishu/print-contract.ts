@@ -551,7 +551,6 @@ function buildContractHtml(p: {
         <th style="width:12%;">数量（台）</th>
         <th style="width:16%;">出厂含税单价（元/台）</th>
         <th style="width:14%;">金额（元）</th>
-        <th style="width:16%;">产品备注</th>
       </tr>
     </thead>
     <tbody>
@@ -568,6 +567,8 @@ function buildContractHtml(p: {
   <div class="para">合同总价：人民币${escapeHtml(p.totalPrice)}元（大写：${escapeHtml(totalUpper)}），含13%增值税。</div>
   <div class="para">交货地点：供方指定，货物风险与损失责任在双方签收《送货单/交接单》时转移。</div>
   <div class="para">计划交货期：${escapeHtml(p.plannedDelivery || "")}，具体以需方通知的出货计划为准</div>
+  <div class="para">产品备注：${escapeHtml(p.productRemark)}</div>
+
 
 
   ${p.productImgDataUrl ? `
