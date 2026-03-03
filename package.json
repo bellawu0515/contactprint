@@ -17,6 +17,8 @@
     "express": "^4.19.2",
     "lucide-react": "^0.562.0",
     "puppeteer-core": "^24.34.0",
+    "docxtemplater": "^3.68.3",
+    "pizzip": "^3.2.0"
     "react": "^19.2.3",
     "react-dom": "^19.2.3",
     "recharts": "^3.6.0"
