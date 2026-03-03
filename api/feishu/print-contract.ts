@@ -566,6 +566,29 @@ export default async function handler(req: any, res: any) {
       { method: "GET" }
     );
     const fields = rec?.data?.record?.fields || {};
+        // ===== DEBUG 开关：飞书请求里带 debug:true 才打印 =====
+    const debug = !!body?.debug;
+    const j = (x: any) => {
+      try { return JSON.stringify(x); } catch { return String(x); }
+    };
+    const log = (...args: any[]) => { if (debug) console.log(...args); };
+    
+    // 打印这条记录有哪些字段名（最关键）
+    log("FIELDS_KEYS:", Object.keys(fields));
+    
+    // 打印我们关心的3个原始字段结构
+    const _payRaw = pickFieldLoose(fields, ["付款条件"]);
+    const _tailRaw = pickFieldLoose(fields, ["尾款条件"]);
+    const _imgRaw = pickFieldLoose(fields, [process.env.FEISHU_PRODUCT_IMAGE_FIELD || "产品图", "产品图片", "产品主图", "参考图", "图片"]);
+    
+    log("payCondRaw:", j(_payRaw).slice(0, 2000));
+    log("tailCondRaw:", j(_tailRaw).slice(0, 2000));
+    log("imgRaw:", j(_imgRaw).slice(0, 2000));
+    
+    // 如果是“引用/关联”，看看是不是 record_ids 结构
+    log("payLinks:", j(extractLinkItems(_payRaw)));
+    log("tailLinks:", j(extractLinkItems(_tailRaw)));
+    log("imgLinks:", j(extractLinkItems(_imgRaw)));
 
     // ===================== 付款条件/尾款条件（引用/查找引用）=====================
     const payCondRaw = pickFieldLoose(fields, ["付款条件"]);
