@@ -3,7 +3,7 @@
     "api/feishu/print-contract.ts": {
       "maxDuration": 60,
       "memory": 1024,
-      "includeFiles": "public/fonts/**"
+      "includeFiles": ["public/fonts/**", "templates/**"]
     }
   }
 }
