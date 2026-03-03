@@ -2,8 +2,6 @@
 import type { IncomingMessage } from "http";
 import fs from "fs";
 import path from "path";
-
-// puppeteer only for optional pdf
 import chromium from "@sparticuz/chromium";
 import puppeteer from "puppeteer-core";
 
@@ -83,6 +81,23 @@ function isLikelyId(s: string) {
   return /^(optr|rec|tbl)[A-Za-z0-9]+$/.test((s || "").trim());
 }
 
+function normalizeKey(s: string) {
+  return String(s || "").replace(/\s+/g, "").trim();
+}
+
+function pickFieldLoose(fields: Record<string, any>, keys: string[]) {
+  // exact first
+  for (const k of keys) if (k in fields) return fields[k];
+  // loose match (remove spaces)
+  const fieldKeys = Object.keys(fields);
+  for (const k of keys) {
+    const nk = normalizeKey(k);
+    const hit = fieldKeys.find((fk) => normalizeKey(fk) === nk);
+    if (hit) return (fields as any)[hit];
+  }
+  return undefined;
+}
+
 function toText(v: any): string {
   if (v === null || v === undefined) return "";
   if (typeof v === "string") return v.trim();
@@ -93,7 +108,6 @@ function toText(v: any): string {
       .map((it) => {
         if (it === null || it === undefined) return "";
         if (typeof it === "string" || typeof it === "number") return String(it);
-
         if (typeof it === "object") {
           if (Array.isArray((it as any).text_arr)) return (it as any).text_arr.join("");
           if (typeof (it as any).text === "string") return (it as any).text;
@@ -119,7 +133,7 @@ function toText(v: any): string {
   return "";
 }
 
-// 把复杂结构尽量抽成“可读文本”（忽略 optr/rec/tbl）
+// 尽量抽“可读文本”（忽略 optr/rec/tbl/undefined）
 function extractReadableText(v: any): string {
   const out: string[] = [];
   const seen = new Set<any>();
@@ -160,20 +174,23 @@ function extractReadableText(v: any): string {
   return Array.from(new Set(out)).join("，");
 }
 
-function normalizeKey(s: string) {
-  return String(s || "").replace(/\s+/g, "").trim();
+function scoreText(text: string, patterns: string[]) {
+  let s = 0;
+  for (const p of patterns) if (text.includes(p)) s += 10;
+  // prefer not too long and not too short
+  s += Math.min(text.length, 60) / 60;
+  return s;
 }
 
-// 字段名可能带空格/隐藏字符，用 loose 取
-function pickFieldLoose(fields: Record<string, any>, keys: string[]) {
-  for (const k of keys) if (k in fields) return fields[k];
-  const fieldKeys = Object.keys(fields);
-  for (const k of keys) {
-    const nk = normalizeKey(k);
-    const hit = fieldKeys.find((fk) => normalizeKey(fk) === nk);
-    if (hit) return (fields as any)[hit];
+function bestTextFromFields(fields: Record<string, any>, patterns: string[]) {
+  const candidates: string[] = [];
+  for (const v of Object.values(fields)) {
+    const t = extractReadableText(v);
+    if (t && !isLikelyId(t)) candidates.push(t);
   }
-  return undefined;
+  if (!candidates.length) return "";
+  candidates.sort((a, b) => scoreText(b, patterns) - scoreText(a, patterns));
+  return candidates[0] || "";
 }
 
 function num(v: any) {
@@ -214,9 +231,7 @@ function fmtDateCn(v: any) {
   return s;
 }
 
-// -------------------- link/attachment helpers --------------------
-
-// 关联记录结构：[{table_id, record_ids:[...]}]
+// -------------------- link / attachment helpers --------------------
 function extractLinkItems(v: any): Array<{ table_id: string; record_ids: string[] }> {
   const out: Array<{ table_id: string; record_ids: string[] }> = [];
   const pushIf = (obj: any) => {
@@ -231,7 +246,6 @@ function extractLinkItems(v: any): Array<{ table_id: string; record_ids: string[
   return out;
 }
 
-// 尽量从字段值里找 file_token
 function pickFileToken(v: any): string | null {
   if (!v) return null;
 
@@ -246,6 +260,7 @@ function pickFileToken(v: any): string | null {
       if (t) return String(t);
     }
   }
+
   if (typeof v === "object") {
     const t =
       (v as any).file_token ||
@@ -255,10 +270,10 @@ function pickFileToken(v: any): string | null {
       null;
     if (t) return String(t);
   }
+
   return null;
 }
 
-// 下载媒体到 Buffer（docx 图片用）
 async function downloadMediaToBuffer(fileToken: string): Promise<Buffer> {
   const token = await getTenantAccessToken();
   const res = await fetch(
@@ -273,99 +288,113 @@ async function downloadMediaToBuffer(fileToken: string): Promise<Buffer> {
   return Buffer.from(ab);
 }
 
-// 从来源记录 fields 里按关键词“挑最像的文本”
-function pickBestTextFromFields(sourceFields: Record<string, any>, keywords: string[]) {
-  const candidates: string[] = [];
-  for (const v of Object.values(sourceFields)) {
-    const t = extractReadableText(v);
-    if (t && !isLikelyId(t)) candidates.push(t);
-  }
-  if (!candidates.length) return "";
-
-  const score = (s: string) =>
-    keywords.reduce((acc, k) => acc + (s.includes(k) ? 10 : 0), 0) + Math.min(s.length, 60) / 60;
-
-  candidates.sort((a, b) => score(b) - score(a));
-  return candidates[0] || "";
-}
-
-// 核心：解析“引用字段”的文本 —— 不需要知道来源表字段名
-async function resolveLinkedText(appToken: string, raw: any, keywords: string[]) {
-  // 1) 当前字段直接抽文本
+// 解析引用文本：优先直接抽；否则遍历所有引用字段并在来源记录中找最匹配文本
+async function resolveTextAny(
+  appToken: string,
+  raw: any,
+  allFields: Record<string, any>,
+  patterns: string[]
+): Promise<string> {
+  // 1) direct
   const direct = extractReadableText(raw);
   if (direct && !isLikelyId(direct)) return direct;
 
-  // 2) 引用/关联：沿 record_ids 去来源表取
-  const links = extractLinkItems(raw);
-  const LIMIT = 10;
-  let cnt = 0;
-
-  for (const link of links) {
-    for (const rid of link.record_ids) {
-      cnt++;
-      if (cnt > LIMIT) break;
-
-      const rec2 = await feishuFetch(
-        `/bitable/v1/apps/${encodeURIComponent(appToken)}/tables/${encodeURIComponent(link.table_id)}/records/${encodeURIComponent(rid)}`,
-        { method: "GET" }
-      );
-      const f2 = rec2?.data?.record?.fields || {};
-
-      // 2.1 常见字段名先扫一遍（命中率高）
-      const commonKeys = ["规则名称", "条款名称", "名称", "标题", "文本", "付款条件", "尾款条件"];
-      for (const k of commonKeys) {
-        if (k in f2) {
-          const t = extractReadableText((f2 as any)[k]);
-          if (t && !isLikelyId(t)) return t;
-        }
+  // 2) follow the raw's links if possible
+  const tryLinks = async (links: Array<{ table_id: string; record_ids: string[] }>) => {
+    const LIMIT = 12;
+    let cnt = 0;
+    for (const link of links) {
+      for (const rid of link.record_ids) {
+        cnt++;
+        if (cnt > LIMIT) break;
+        const rec2 = await feishuFetch(
+          `/bitable/v1/apps/${encodeURIComponent(appToken)}/tables/${encodeURIComponent(link.table_id)}/records/${encodeURIComponent(rid)}`,
+          { method: "GET" }
+        );
+        const f2 = rec2?.data?.record?.fields || {};
+        const best = bestTextFromFields(f2, patterns);
+        if (best) return best;
       }
-
-      // 2.2 再按关键词从所有字段里挑一个最像的
-      const best = pickBestTextFromFields(f2, keywords);
-      if (best) return best;
     }
+    return "";
+  };
+
+  const rawLinks = extractLinkItems(raw);
+  if (rawLinks.length) {
+    const best = await tryLinks(rawLinks);
+    if (best) return best;
+  }
+
+  // 3) fallback: scan contract record fields for any value that already contains patterns
+  // (in case field name isn't 付款条件 but value exists)
+  const bestInSelf = bestTextFromFields(allFields, patterns);
+  if (bestInSelf) return bestInSelf;
+
+  // 4) final fallback: scan ALL link fields in the contract record, fetch their records and pick best
+  const linkValues = Object.values(allFields);
+  let tried = 0;
+  for (const v of linkValues) {
+    const links = extractLinkItems(v);
+    if (!links.length) continue;
+    tried++;
+    if (tried > 8) break; // limit
+    const best = await tryLinks(links);
+    if (best) return best;
   }
 
   return "";
 }
 
-// 核心：解析“引用图片字段”的 file_token —— 不需要知道来源表字段名
-async function resolveImageToken(appToken: string, raw: any) {
-  // 1) 直接是附件字段
-  const tok = pickFileToken(raw);
-  if (tok) return tok;
+// 解析引用图片 token：优先直接 token；否则扫描所有字段/所有引用来源记录
+async function resolveImageTokenAny(appToken: string, raw: any, allFields: Record<string, any>): Promise<string | null> {
+  // 1) direct token
+  const t0 = pickFileToken(raw);
+  if (t0) return t0;
 
-  // 2) 引用/关联：沿 record_ids 去来源表扫附件
-  const links = extractLinkItems(raw);
-  const LIMIT = 10;
-  let cnt = 0;
+  // 2) scan all fields direct token
+  for (const v of Object.values(allFields)) {
+    const t = pickFileToken(v);
+    if (t) return t;
+  }
 
-  for (const link of links) {
-    for (const rid of link.record_ids) {
-      cnt++;
-      if (cnt > LIMIT) break;
-
-      const rec2 = await feishuFetch(
-        `/bitable/v1/apps/${encodeURIComponent(appToken)}/tables/${encodeURIComponent(link.table_id)}/records/${encodeURIComponent(rid)}`,
-        { method: "GET" }
-      );
-      const f2 = rec2?.data?.record?.fields || {};
-
-      // 常见字段名优先
-      const commonKeys = ["产品图", "产品图片", "主图", "图片", "参考图"];
-      for (const k of commonKeys) {
-        if (k in f2) {
-          const t = pickFileToken((f2 as any)[k]);
-          if (t) return t;
+  // 3) follow raw's links first
+  const scanLinksForToken = async (links: Array<{ table_id: string; record_ids: string[] }>) => {
+    const LIMIT = 12;
+    let cnt = 0;
+    for (const link of links) {
+      for (const rid of link.record_ids) {
+        cnt++;
+        if (cnt > LIMIT) break;
+        const rec2 = await feishuFetch(
+          `/bitable/v1/apps/${encodeURIComponent(appToken)}/tables/${encodeURIComponent(link.table_id)}/records/${encodeURIComponent(rid)}`,
+          { method: "GET" }
+        );
+        const f2 = rec2?.data?.record?.fields || {};
+        // scan all fields for file token
+        for (const vv of Object.values(f2)) {
+          const tok = pickFileToken(vv);
+          if (tok) return tok;
         }
       }
-
-      // 兜底扫所有字段
-      for (const v of Object.values(f2)) {
-        const t = pickFileToken(v);
-        if (t) return t;
-      }
     }
+    return null;
+  };
+
+  const rawLinks = extractLinkItems(raw);
+  if (rawLinks.length) {
+    const tok = await scanLinksForToken(rawLinks);
+    if (tok) return tok;
+  }
+
+  // 4) scan ALL link fields in contract
+  let tried = 0;
+  for (const v of Object.values(allFields)) {
+    const links = extractLinkItems(v);
+    if (!links.length) continue;
+    tried++;
+    if (tried > 10) break;
+    const tok = await scanLinksForToken(links);
+    if (tok) return tok;
   }
 
   return null;
@@ -391,7 +420,6 @@ async function renderDocxFromTemplate(templateAbsPath: string, data: Record<stri
   const content = fs.readFileSync(templateAbsPath, "binary");
   const zip = new PizZip(content);
 
-  // 模板里用 {%%product_img}，我们在 data 里传 Buffer 到 product_img
   const imageModule = new ImageModule({
     centered: true,
     fileType: "docx",
@@ -461,7 +489,7 @@ async function uploadFileToBitable(appToken: string, buf: Buffer, fileName: stri
   return fileToken as string;
 }
 
-// -------------------- optional pdf (minimal) --------------------
+// -------------------- optional pdf --------------------
 async function getLaunchOptions() {
   const isVercel = !!process.env.VERCEL || !!process.env.AWS_LAMBDA_FUNCTION_VERSION;
   if (isVercel) {
@@ -497,7 +525,7 @@ export default async function handler(req: any, res: any) {
       return;
     }
 
-    // 简单鉴权：可选
+    // token (optional)
     const token = process.env.WEBHOOK_TOKEN;
     if (token) {
       const got = (req.headers["x-webhook-token"] as string | undefined) || (req.headers["X-Webhook-Token"] as any);
@@ -521,34 +549,26 @@ export default async function handler(req: any, res: any) {
     const attachmentField = process.env.FEISHU_CONTRACT_ATTACHMENT_FIELD || "合同附件";
     if (!appToken || !tableId) throw new Error("Missing FEISHU_APP_TOKEN / FEISHU_CONTRACT_TABLE_ID");
 
-    // 1) 拉取合同记录
+    // 1) get record
     const rec = await feishuFetch(
       `/bitable/v1/apps/${encodeURIComponent(appToken)}/tables/${encodeURIComponent(tableId)}/records/${encodeURIComponent(recordId)}`,
       { method: "GET" }
     );
-
     const fields = rec?.data?.record?.fields || {};
 
-    // ===================== 付款条件 / 尾款条件（引用兜底解析）=====================
-    const payCondRaw = pickFieldLoose(fields, ["付款条件"]);
-    const tailCondRaw = pickFieldLoose(fields, ["尾款条件"]);
+    // 2) resolve terms (smart)
+    const payRaw = pickFieldLoose(fields, ["付款条件", "付款方式", "账期明细", "帐期明细"]);
+    const tailRaw = pickFieldLoose(fields, ["尾款条件", "尾款", "账期", "帐期"]);
 
-    const paymentTerms = await resolveLinkedText(appToken, payCondRaw, ["预付", "无预付", "N+", "%", "账期"]);
-    const tailPay = await resolveLinkedText(appToken, tailCondRaw, ["出货", "月", "付清", "尾款", "N+"]);
+    const paymentTerms = await resolveTextAny(appToken, payRaw, fields, ["预付", "无预付", "N+", "%", "账期"]);
+    const tailPay = await resolveTextAny(appToken, tailRaw, fields, ["出货", "月", "付清", "尾款", "N+"]);
 
-    // ===================== 产品图（引用图片）=====================
+    // 3) resolve image token (smart)
     const contractImageField = process.env.FEISHU_PRODUCT_IMAGE_FIELD || "产品图";
     const imgRaw = pickFieldLoose(fields, [contractImageField, "产品图片", "产品主图", "参考图", "图片"]);
-    let imgToken = await resolveImageToken(appToken, imgRaw);
+    const imgToken = await resolveImageTokenAny(appToken, imgRaw, fields);
 
-    // 如果合同图没拿到，再尝试从 SKU 引用里拿
-    const skuLinkField = process.env.FEISHU_SKU_LINK_FIELD || "SKU";
-    const skuVal = pickFieldLoose(fields, [skuLinkField, "产品SKU", "产品SKU/规格"]);
-    if (!imgToken) {
-      imgToken = await resolveImageToken(appToken, skuVal);
-    }
-
-    // ===================== 其他字段 =====================
+    // 4) other fields
     const contractNo = toText(pickFieldLoose(fields, ["合同号", "合同编号"]) || "");
     const sku = toText(pickFieldLoose(fields, ["产品SKU", "SKU", "型号/规格"]) || "");
     const productName = toText(pickFieldLoose(fields, ["产品名称", "品名"]) || "");
@@ -575,19 +595,15 @@ export default async function handler(req: any, res: any) {
     const signDateRaw = pickFieldLoose(fields, ["签订日期"]);
     const signDate = signDateRaw ? fmtDateCn(signDateRaw) : fmtDateCn(Date.now());
 
-    // 数量单位：如果你有 SKU 主档的“数量单位”引用，也可以继续扩展；这里默认台
     const qtyUnit = "台";
 
-    // 预付款金额
     const prepayText = toText(pickFieldLoose(fields, ["预付款金额", "预付款", "预付金额"]) || "");
-    const prepayNum = num(prepayText);
 
-    // ===================== 生成文件 =====================
+    // 5) generate
     if (format === "pdf") {
       const html = `
         <html><body style="font-family:Arial">
-          <h2>合同 ${contractNo}</h2>
-          <p>产品：${productName} / ${sku}</p>
+          <h3>合同 ${contractNo}</h3>
           <p>付款条件：${paymentTerms}</p>
           <p>尾款条件：${tailPay}</p>
         </body></html>
@@ -613,11 +629,10 @@ export default async function handler(req: any, res: any) {
       return;
     }
 
-    // ===== Word (docx) =====
+    // docx
     const templateName = process.env.CONTRACT_TEMPLATE_NAME || "采购合同_模板_变量版.docx";
     const templatePath = path.join(process.cwd(), "templates", templateName);
 
-    // 产品图 buffer
     const productImgBuf = imgToken ? await downloadMediaToBuffer(imgToken) : null;
 
     const docxBuf = await renderDocxFromTemplate(templatePath, {
@@ -639,19 +654,14 @@ export default async function handler(req: any, res: any) {
       数量单位: qtyUnit,
       含税出厂单价: unitPrice,
       采购总价: totalPrice,
-      采购总价大写: (() => {
-        const n = num(totalPrice);
-        return n ? String(n) : "";
-      })(),
 
       产品备注: productRemark,
 
       付款条件: paymentTerms || "",
       预付款金额: prepayText || "",
-      预付款金额大写: prepayNum ? String(prepayNum) : "",
       尾款条件: tailPay || "",
 
-      // 模板里要放 {%%product_img}
+      // template: {%%product_img}
       product_img: productImgBuf || null,
     });
 
