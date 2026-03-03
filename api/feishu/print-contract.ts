@@ -692,8 +692,34 @@ async function htmlToPdfBuffer(html: string) {
   }
 }
 
-// -------------------- upload pdf as bitable_file media --------------------
-async function uploadPdfToBitable(appToken: string, pdf: Buffer, fileName: string) {
+
+
+// -------------------- render docx from template (docxtemplater) --------------------
+// Template placeholders建议使用 {{变量名}}（更稳定），对应 render 时的 delimiters。
+async function renderDocxFromTemplate(templateAbsPath: string, data: Record<string, any>) {
+  const [{ default: PizZip }, { default: Docxtemplater }] = await Promise.all([
+    import("pizzip"),
+    import("docxtemplater"),
+  ]);
+
+  const content = fs.readFileSync(templateAbsPath, "binary");
+  const zip = new PizZip(content);
+
+  const doc = new Docxtemplater(zip, {
+    paragraphLoop: true,
+    linebreaks: true,
+    delimiters: { start: "{{", end: "}}" },
+  });
+
+  doc.render(data);
+
+  return doc.getZip().generate({
+    type: "nodebuffer",
+    compression: "DEFLATE",
+  }) as Buffer;
+}
+// -------------------- upload file (pdf/docx/...) as bitable_file media --------------------
+async function uploadFileToBitable(appToken: string, buf: Buffer, fileName: string, mime: string) {
   const FormDataAny: any = (globalThis as any).FormData;
   const BlobAny: any = (globalThis as any).Blob;
   if (!FormDataAny || !BlobAny) throw new Error("Missing FormData/Blob in runtime (need Node 18+)");
@@ -707,8 +733,8 @@ async function uploadPdfToBitable(appToken: string, pdf: Buffer, fileName: strin
   form.append("file_name", fileName);
   form.append("parent_type", parentType);
   form.append("parent_node", parentNode);
-  form.append("size", String(pdf.length));
-  form.append("file", new BlobAny([pdf], { type: "application/pdf" }), fileName);
+  form.append("size", String(buf.length));
+  form.append("file", new BlobAny([buf], { type: mime }), fileName);
 
   const token = await getTenantAccessToken();
   const res = await fetch("https://open.feishu.cn/open-apis/drive/v1/medias/upload_all", {
@@ -729,11 +755,17 @@ async function uploadPdfToBitable(appToken: string, pdf: Buffer, fileName: strin
   if (!res.ok || !fileToken) {
     const nodeHint = typeof parentNode === "string" ? parentNode.slice(0, 10) : "";
     throw new Error(
-      `Upload PDF failed: ${res.status} code=${data?.code ?? "?"} msg=${data?.msg ?? ""} parent_type=${parentType} parent_node~=${nodeHint} data=${JSON.stringify(data)}`
+      `Upload file failed: ${res.status} code=${data?.code ?? "?"} msg=${data?.msg ?? ""} parent_type=${parentType} parent_node~=${nodeHint} data=${JSON.stringify(data)}`
     );
   }
   return fileToken as string;
 }
+
+// 兼容旧逻辑：PDF
+async function uploadPdfToBitable(appToken: string, pdf: Buffer, fileName: string) {
+  return uploadFileToBitable(appToken, pdf, fileName, "application/pdf");
+}
+
 
 // -------------------- main handler --------------------
 export default async function handler(req: any, res: any) {
@@ -755,6 +787,7 @@ export default async function handler(req: any, res: any) {
 
     const body = await readJson(req);
     const recordId = body?.record_id || body?.recordId;
+    const format = String(body?.format || "docx").toLowerCase(); // 默认输出 Word
     if (!recordId) {
       res.status(400).json({ ok: false, error: "Missing record_id" });
       return;
@@ -859,15 +892,16 @@ export default async function handler(req: any, res: any) {
     }
 
     let productImgDataUrl: string | undefined = undefined;
-    if (imgToken) {
+    if (format === "pdf" && imgToken) {
       productImgDataUrl = await downloadMediaToDataUrl(imgToken);
     }
 
     // 关键：注入字体（解决中文乱码/空白）
-    const fontCss = getEmbeddedFontCss();
+    const fontCss = format === "pdf" ? getEmbeddedFontCss() : "";
 
-    // 2) 生成 PDF
-    const html = buildContractHtml({
+    // 2) 生成文件（默认 Word；若 format=pdf 则生成 PDF）
+    if (format === "pdf") {
+      const html = buildContractHtml({
       contractNo,
       signDate,
       signPlace,
@@ -890,34 +924,113 @@ export default async function handler(req: any, res: any) {
       fontCss,
     });
 
-    const pdf = await htmlToPdfBuffer(html);
+  const pdf = await htmlToPdfBuffer(html);
 
-    // 3) 上传 PDF 得到 file_token
-    const safeContractNo = (contractNo || "合同").replace(/[\\/:*?"<>|]/g, "_");
-    const safeSku = (sku || "").replace(/[\\/:*?"<>|]/g, "_");
-    const fileName = `${safeContractNo}${safeSku ? "_" + safeSku : ""}.pdf`;
+  // 3) 上传 PDF 得到 file_token
+  const safeContractNo = (contractNo || "合同").replace(/[\\/:*?"<>|]/g, "_");
+  const safeSku = (sku || "").replace(/[\\/:*?"<>|]/g, "_");
+  const fileName = `${safeContractNo}${safeSku ? "_" + safeSku : ""}.pdf`;
 
-    const fileToken = await uploadPdfToBitable(appToken, pdf, fileName);
+  const fileToken = await uploadPdfToBitable(appToken, pdf, fileName);
 
-    // 4) 回写到“合同附件”
-    const updatePayload = {
-      fields: {
-        [attachmentField]: [{ file_token: fileToken, name: fileName }],
-      },
-    };
+  // 4) 回写到“合同附件”
+  const updatePayload = {
+    fields: {
+      [attachmentField]: [{ file_token: fileToken, name: fileName }],
+    },
+  };
 
-    await feishuFetch(
-      `/bitable/v1/apps/${encodeURIComponent(appToken)}/tables/${encodeURIComponent(tableId)}/records/${encodeURIComponent(recordId)}`,
-      {
-        method: "PUT",
-        headers: { "Content-Type": "application/json; charset=utf-8" },
-        body: JSON.stringify(updatePayload),
-      }
-    );
+  await feishuFetch(
+    `/bitable/v1/apps/${encodeURIComponent(appToken)}/tables/${encodeURIComponent(tableId)}/records/${encodeURIComponent(recordId)}`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify(updatePayload),
+    }
+  );
 
-    res.status(200).json({ ok: true, record_id: recordId, file_token: fileToken, file_name: fileName });
+  res.status(200).json({ ok: true, record_id: recordId, file_token: fileToken, file_name: fileName, format: "pdf" });
+  return;
+}
+
+// ===== Word (docx) =====
+// 模板文件放在项目根目录 templates/ 下（需要在 vercel.json 的 includeFiles 里加入 templates/**）
+const templateName = process.env.CONTRACT_TEMPLATE_NAME || "采购合同_模板_变量版.docx";
+const templatePath = path.join(process.cwd(), "templates", templateName);
+
+// 预付款金额（可选）
+const prepayText = toText(pickField(fields, ["预付款金额", "预付款", "预付金额"]) || "");
+const prepayNum = num(prepayText);
+
+const docxBuf = await renderDocxFromTemplate(templatePath, {
+  合同号: contractNo,
+  下单日期: signDate,
+  预计交货日期: plannedDelivery,
+
+  供应商名称: supplierName,
+  供应商联系人: supplierContact,
+  供应商联系电话: supplierPhone,
+
+  采购方: buyerName,
+  采购方联系人: buyerContact,
+  采购方联系电话: buyerPhone,
+
+  产品名称: productName,
+  产品sku: sku,
+  采购数量: qty,
+  数量单位: qtyUnit,
+  含税出厂单价: unitPrice,
+  采购总价: totalPrice,
+  采购总价大写: (() => {
+    const n = num(totalPrice);
+    return n ? rmbUppercase(n) : "";
+  })(),
+
+  净重: toText(pickField(fields, ["净重"]) || ""),
+  毛重: toText(pickField(fields, ["毛重"]) || ""),
+  包装尺寸: toText(pickField(fields, ["包装尺寸"]) || ""),
+  产品备注: productRemark,
+
+  帐期明细: paymentTerms,
+  预付款金额: prepayText,
+  预付款金额大写: prepayNum ? rmbUppercase(prepayNum) : "",
+  帐期: toText(pickField(fields, ["帐期", "账期", "尾款条件"]) || ""),
+});
+
+// 3) 上传 Word 得到 file_token
+const safeContractNo = (contractNo || "合同").replace(/[\\/:*?"<>|]/g, "_");
+const safeSku = (sku || "").replace(/[\\/:*?"<>|]/g, "_");
+const fileName = `${safeContractNo}${safeSku ? "_" + safeSku : ""}.docx`;
+
+const fileToken = await uploadFileToBitable(
+  appToken,
+  docxBuf,
+  fileName,
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+);
+
+// 4) 回写到“合同附件”
+const updatePayload = {
+  fields: {
+    [attachmentField]: [{ file_token: fileToken, name: fileName }],
+  },
+};
+
+await feishuFetch(
+  `/bitable/v1/apps/${encodeURIComponent(appToken)}/tables/${encodeURIComponent(tableId)}/records/${encodeURIComponent(recordId)}`,
+  {
+    method: "PUT",
+    headers: { "Content-Type": "application/json; charset=utf-8" },
+    body: JSON.stringify(updatePayload),
+  }
+);
+
+res.status(200).json({ ok: true, record_id: recordId, file_token: fileToken, file_name: fileName, format: "docx" });
+return;
+
   } catch (e: any) {
     console.error(e);
     res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 }
+
