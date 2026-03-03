@@ -960,6 +960,7 @@ const templatePath = path.join(process.cwd(), "templates", templateName);
 
 // 预付款金额（可选）
 const prepayText = toText(pickField(fields, ["预付款金额", "预付款", "预付金额"]) || "");
+const tailPay = toText(pickField(fields, ["尾款条件", "帐期", "账期"]) || "");
 const prepayNum = num(prepayText);
 
 const docxBuf = await renderDocxFromTemplate(templatePath, {
@@ -991,10 +992,9 @@ const docxBuf = await renderDocxFromTemplate(templatePath, {
   包装尺寸: toText(pickField(fields, ["包装尺寸"]) || ""),
   产品备注: productRemark,
 
-  帐期明细: paymentTerms,
+  付款条件: paymentTerms,
   预付款金额: prepayText,
-  预付款金额大写: prepayNum ? rmbUppercase(prepayNum) : "",
-  帐期: toText(pickField(fields, ["帐期", "账期", "尾款条件"]) || ""),
+  尾款条件: tailPay,
 });
 
 // 3) 上传 Word 得到 file_token
