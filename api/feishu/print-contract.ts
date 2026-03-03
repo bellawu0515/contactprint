@@ -2,6 +2,8 @@
 import type { IncomingMessage } from "http";
 import fs from "fs";
 import path from "path";
+
+// puppeteer only for optional pdf
 import chromium from "@sparticuz/chromium";
 import puppeteer from "puppeteer-core";
 
@@ -76,7 +78,11 @@ async function feishuFetch(path0: string, init?: RequestInit) {
   return json;
 }
 
-// -------------------- value normalize --------------------
+// -------------------- normalize helpers --------------------
+function isLikelyId(s: string) {
+  return /^(optr|rec|tbl)[A-Za-z0-9]+$/.test((s || "").trim());
+}
+
 function toText(v: any): string {
   if (v === null || v === undefined) return "";
   if (typeof v === "string") return v.trim();
@@ -87,13 +93,13 @@ function toText(v: any): string {
       .map((it) => {
         if (it === null || it === undefined) return "";
         if (typeof it === "string" || typeof it === "number") return String(it);
+
         if (typeof it === "object") {
           if (Array.isArray((it as any).text_arr)) return (it as any).text_arr.join("");
           if (typeof (it as any).text === "string") return (it as any).text;
           if (typeof (it as any).name === "string") return (it as any).name;
           if (typeof (it as any).value === "string") return (it as any).value;
           if (typeof (it as any).value === "number") return String((it as any).value);
-          if (typeof (it as any).timestamp === "number") return String((it as any).timestamp);
         }
         return "";
       })
@@ -108,33 +114,12 @@ function toText(v: any): string {
     if (typeof (v as any).name === "string") return (v as any).name;
     if (typeof (v as any).value === "string") return (v as any).value;
     if (typeof (v as any).value === "number") return String((v as any).value);
-    if (typeof (v as any).timestamp === "number") return String((v as any).timestamp);
   }
 
   return "";
 }
 
-function normalizeKey(s: string) {
-  return String(s || "").replace(/\s+/g, "").trim();
-}
-
-function pickFieldLoose(fields: Record<string, any>, keys: string[]) {
-  for (const k of keys) {
-    if (k in fields) return fields[k];
-  }
-  const fieldKeys = Object.keys(fields);
-  for (const k of keys) {
-    const nk = normalizeKey(k);
-    const hit = fieldKeys.find((fk) => normalizeKey(fk) === nk);
-    if (hit) return (fields as any)[hit];
-  }
-  return undefined;
-}
-
-function looksLikeId(s: string) {
-  return /^(optr|rec|tbl)[A-Za-z0-9]+$/.test((s || "").trim());
-}
-
+// 把复杂结构尽量抽成“可读文本”（忽略 optr/rec/tbl）
 function extractReadableText(v: any): string {
   const out: string[] = [];
   const seen = new Set<any>();
@@ -147,31 +132,26 @@ function extractReadableText(v: any): string {
     if (typeof x === "string") {
       const s = x.trim();
       if (!s) return;
-      if (looksLikeId(s)) return;
+      if (isLikelyId(s)) return;
       if (s === "undefined" || s === "null") return;
       out.push(s);
       return;
     }
-
     if (typeof x === "number") {
       out.push(String(x));
       return;
     }
-
     if (Array.isArray(x)) {
       x.forEach(visit);
       return;
     }
-
     if (typeof x === "object") {
-      const preferKeys = ["text", "name", "label", "display_value", "displayValue", "value"];
-      for (const k of preferKeys) {
-        if (k in x) visit((x as any)[k]);
-      }
-      const listKeys = ["text_arr", "textArr", "values", "value_list", "valueList", "lookup_values", "lookupValues"];
-      for (const k of listKeys) {
-        if (k in x) visit((x as any)[k]);
-      }
+      const prefer = ["text", "name", "label", "display_value", "displayValue", "value"];
+      for (const k of prefer) if (k in x) visit((x as any)[k]);
+
+      const preferList = ["text_arr", "textArr", "values", "value_list", "valueList", "lookup_values", "lookupValues"];
+      for (const k of preferList) if (k in x) visit((x as any)[k]);
+
       for (const val of Object.values(x)) visit(val);
     }
   };
@@ -180,9 +160,18 @@ function extractReadableText(v: any): string {
   return Array.from(new Set(out)).join("，");
 }
 
-function pickField(fields: Record<string, any>, keys: string[]) {
+function normalizeKey(s: string) {
+  return String(s || "").replace(/\s+/g, "").trim();
+}
+
+// 字段名可能带空格/隐藏字符，用 loose 取
+function pickFieldLoose(fields: Record<string, any>, keys: string[]) {
+  for (const k of keys) if (k in fields) return fields[k];
+  const fieldKeys = Object.keys(fields);
   for (const k of keys) {
-    if (k in fields) return fields[k];
+    const nk = normalizeKey(k);
+    const hit = fieldKeys.find((fk) => normalizeKey(fk) === nk);
+    if (hit) return (fields as any)[hit];
   }
   return undefined;
 }
@@ -219,76 +208,17 @@ function fmtDateCn(v: any) {
       return `${y}年${m}月${dd}日`;
     }
   }
-
-  const s0 = toText(v);
-  const s = s0.replace(/\.0+$/g, "").trim();
-
-  if (/^\d{13}$/.test(s)) return fmtDateCn(Number(s));
-  if (/^\d{10}$/.test(s)) return fmtDateCn(Number(s) * 1000);
-
+  const s = toText(v).trim();
   const m = s.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})/);
   if (m) return `${m[1]}年${Number(m[2])}月${Number(m[3])}日`;
-
   return s;
 }
 
-function rmbUppercase(amount: number) {
-  if (!Number.isFinite(amount)) return "";
-  const CN_NUM = ["零", "壹", "贰", "叁", "肆", "伍", "陆", "柒", "捌", "玖"];
-  const CN_UNIT = ["", "拾", "佰", "仟"];
-  const CN_GROUP = ["", "万", "亿", "兆"];
-  const CN_DEC = ["角", "分"];
+// -------------------- link/attachment helpers --------------------
 
-  const fixed = Math.round(amount * 100);
-  const integer = Math.floor(fixed / 100);
-  const dec = fixed % 100;
-
-  const intStr = String(integer);
-  let out = "";
-  let groupIndex = 0;
-
-  for (let i = intStr.length; i > 0; i -= 4) {
-    const start = Math.max(0, i - 4);
-    const part = intStr.slice(start, i);
-    let partOut = "";
-    let zeroFlag = false;
-
-    for (let j = 0; j < part.length; j++) {
-      const n = Number(part[j]);
-      const unitIndex = part.length - 1 - j;
-
-      if (n === 0) {
-        zeroFlag = true;
-      } else {
-        if (zeroFlag) partOut += "零";
-        zeroFlag = false;
-        partOut += CN_NUM[n] + CN_UNIT[unitIndex];
-      }
-    }
-
-    partOut = partOut.replace(/零+$/g, "");
-    if (partOut) out = partOut + CN_GROUP[groupIndex] + out;
-    groupIndex++;
-  }
-
-  out = out || "零";
-  out += "元";
-
-  if (dec === 0) return out + "整";
-
-  const jiao = Math.floor(dec / 10);
-  const fen = dec % 10;
-  if (jiao > 0) out += CN_NUM[jiao] + CN_DEC[0];
-  if (fen > 0) out += CN_NUM[fen] + CN_DEC[1];
-  return out;
-}
-
-// ==================== 关联/查找：引用记录、附件 ====================
-
-// 若字段是“关联记录/引用”，常见结构：[{table_id, record_ids:[...]}]
+// 关联记录结构：[{table_id, record_ids:[...]}]
 function extractLinkItems(v: any): Array<{ table_id: string; record_ids: string[] }> {
   const out: Array<{ table_id: string; record_ids: string[] }> = [];
-
   const pushIf = (obj: any) => {
     const table_id = obj?.table_id;
     const record_ids = obj?.record_ids;
@@ -296,48 +226,12 @@ function extractLinkItems(v: any): Array<{ table_id: string; record_ids: string[
       out.push({ table_id, record_ids: record_ids.map((x: any) => String(x)) });
     }
   };
-
-  if (Array.isArray(v)) {
-    for (const it of v) if (it && typeof it === "object") pushIf(it);
-  } else if (v && typeof v === "object") {
-    pushIf(v);
-  }
-
+  if (Array.isArray(v)) for (const it of v) if (it && typeof it === "object") pushIf(it);
+  else if (v && typeof v === "object") pushIf(v);
   return out;
 }
 
-// 读取关联记录：拿指定字段文本（付款条件等）
-async function resolveTextFromLinkedRecords(
-  appToken: string,
-  links: Array<{ table_id: string; record_ids: string[] }>,
-  candidateKeys: string[]
-) {
-  for (const link of links) {
-    for (const rid of link.record_ids) {
-      const rec = await feishuFetch(
-        `/bitable/v1/apps/${encodeURIComponent(appToken)}/tables/${encodeURIComponent(link.table_id)}/records/${encodeURIComponent(rid)}`,
-        { method: "GET" }
-      );
-      const fields = rec?.data?.record?.fields || {};
-
-      for (const k of candidateKeys) {
-        if (k in fields) {
-          const t = extractReadableText((fields as any)[k]) || toText((fields as any)[k]);
-          if (t && !looksLikeId(t)) return t;
-        }
-      }
-
-      // 兜底：扫全字段，取第一个可读文本
-      for (const v of Object.values(fields)) {
-        const t = extractReadableText(v) || toText(v);
-        if (t && !looksLikeId(t)) return t;
-      }
-    }
-  }
-  return "";
-}
-
-// 从字段值里尽量找 file_token（附件/查找引用附件）
+// 尽量从字段值里找 file_token
 function pickFileToken(v: any): string | null {
   if (!v) return null;
 
@@ -352,7 +246,6 @@ function pickFileToken(v: any): string | null {
       if (t) return String(t);
     }
   }
-
   if (typeof v === "object") {
     const t =
       (v as any).file_token ||
@@ -362,40 +255,10 @@ function pickFileToken(v: any): string | null {
       null;
     if (t) return String(t);
   }
-
   return null;
 }
 
-// 读取关联记录：拿附件 file_token（产品图）
-async function resolveAttachmentFromLinkedRecords(
-  appToken: string,
-  links: Array<{ table_id: string; record_ids: string[] }>,
-  candidateKeys: string[] = ["产品图", "产品图片", "主图", "图片", "参考图"]
-) {
-  for (const link of links) {
-    for (const rid of link.record_ids) {
-      const rec = await feishuFetch(
-        `/bitable/v1/apps/${encodeURIComponent(appToken)}/tables/${encodeURIComponent(link.table_id)}/records/${encodeURIComponent(rid)}`,
-        { method: "GET" }
-      );
-      const fields = rec?.data?.record?.fields || {};
-
-      for (const k of candidateKeys) {
-        if (k in fields) {
-          const tok = pickFileToken((fields as any)[k]);
-          if (tok) return tok;
-        }
-      }
-      for (const v of Object.values(fields)) {
-        const tok = pickFileToken(v);
-        if (tok) return tok;
-      }
-    }
-  }
-  return null;
-}
-
-// 下载图片二进制 -> buffer（给 docx 用）
+// 下载媒体到 Buffer（docx 图片用）
 async function downloadMediaToBuffer(fileToken: string): Promise<Buffer> {
   const token = await getTenantAccessToken();
   const res = await fetch(
@@ -410,35 +273,105 @@ async function downloadMediaToBuffer(fileToken: string): Promise<Buffer> {
   return Buffer.from(ab);
 }
 
-// ==================== html -> pdf buffer（可选） ====================
-async function getLaunchOptions() {
-  const isVercel = !!process.env.VERCEL || !!process.env.AWS_LAMBDA_FUNCTION_VERSION;
-  if (isVercel) {
-    return { args: chromium.args, executablePath: await chromium.executablePath(), headless: true };
+// 从来源记录 fields 里按关键词“挑最像的文本”
+function pickBestTextFromFields(sourceFields: Record<string, any>, keywords: string[]) {
+  const candidates: string[] = [];
+  for (const v of Object.values(sourceFields)) {
+    const t = extractReadableText(v);
+    if (t && !isLikelyId(t)) candidates.push(t);
   }
-  const macChrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-  return {
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || (process.platform === "darwin" ? macChrome : undefined),
-    headless: true,
-  };
+  if (!candidates.length) return "";
+
+  const score = (s: string) =>
+    keywords.reduce((acc, k) => acc + (s.includes(k) ? 10 : 0), 0) + Math.min(s.length, 60) / 60;
+
+  candidates.sort((a, b) => score(b) - score(a));
+  return candidates[0] || "";
 }
 
-async function htmlToPdfBuffer(html: string) {
-  const launchOpt = await getLaunchOptions();
-  const browser = await puppeteer.launch(launchOpt as any);
-  try {
-    const page = await browser.newPage();
-    page.setDefaultNavigationTimeout(60_000);
-    await page.setContent(html, { waitUntil: "domcontentloaded" });
-    const pdf = await page.pdf({ format: "A4", printBackground: true, margin: { top: "12mm", right: "12mm", bottom: "12mm", left: "12mm" } });
-    return Buffer.from(pdf);
-  } finally {
-    await browser.close();
+// 核心：解析“引用字段”的文本 —— 不需要知道来源表字段名
+async function resolveLinkedText(appToken: string, raw: any, keywords: string[]) {
+  // 1) 当前字段直接抽文本
+  const direct = extractReadableText(raw);
+  if (direct && !isLikelyId(direct)) return direct;
+
+  // 2) 引用/关联：沿 record_ids 去来源表取
+  const links = extractLinkItems(raw);
+  const LIMIT = 10;
+  let cnt = 0;
+
+  for (const link of links) {
+    for (const rid of link.record_ids) {
+      cnt++;
+      if (cnt > LIMIT) break;
+
+      const rec2 = await feishuFetch(
+        `/bitable/v1/apps/${encodeURIComponent(appToken)}/tables/${encodeURIComponent(link.table_id)}/records/${encodeURIComponent(rid)}`,
+        { method: "GET" }
+      );
+      const f2 = rec2?.data?.record?.fields || {};
+
+      // 2.1 常见字段名先扫一遍（命中率高）
+      const commonKeys = ["规则名称", "条款名称", "名称", "标题", "文本", "付款条件", "尾款条件"];
+      for (const k of commonKeys) {
+        if (k in f2) {
+          const t = extractReadableText((f2 as any)[k]);
+          if (t && !isLikelyId(t)) return t;
+        }
+      }
+
+      // 2.2 再按关键词从所有字段里挑一个最像的
+      const best = pickBestTextFromFields(f2, keywords);
+      if (best) return best;
+    }
   }
+
+  return "";
 }
 
-// -------------------- render docx from template (docxtemplater + image module) --------------------
+// 核心：解析“引用图片字段”的 file_token —— 不需要知道来源表字段名
+async function resolveImageToken(appToken: string, raw: any) {
+  // 1) 直接是附件字段
+  const tok = pickFileToken(raw);
+  if (tok) return tok;
+
+  // 2) 引用/关联：沿 record_ids 去来源表扫附件
+  const links = extractLinkItems(raw);
+  const LIMIT = 10;
+  let cnt = 0;
+
+  for (const link of links) {
+    for (const rid of link.record_ids) {
+      cnt++;
+      if (cnt > LIMIT) break;
+
+      const rec2 = await feishuFetch(
+        `/bitable/v1/apps/${encodeURIComponent(appToken)}/tables/${encodeURIComponent(link.table_id)}/records/${encodeURIComponent(rid)}`,
+        { method: "GET" }
+      );
+      const f2 = rec2?.data?.record?.fields || {};
+
+      // 常见字段名优先
+      const commonKeys = ["产品图", "产品图片", "主图", "图片", "参考图"];
+      for (const k of commonKeys) {
+        if (k in f2) {
+          const t = pickFileToken((f2 as any)[k]);
+          if (t) return t;
+        }
+      }
+
+      // 兜底扫所有字段
+      for (const v of Object.values(f2)) {
+        const t = pickFileToken(v);
+        if (t) return t;
+      }
+    }
+  }
+
+  return null;
+}
+
+// -------------------- docx render with image module --------------------
 const TRANSPARENT_1X1_PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=",
   "base64"
@@ -458,7 +391,7 @@ async function renderDocxFromTemplate(templateAbsPath: string, data: Record<stri
   const content = fs.readFileSync(templateAbsPath, "binary");
   const zip = new PizZip(content);
 
-  // 图片模块：模板里用 {%%product_img}
+  // 模板里用 {%%product_img}，我们在 data 里传 Buffer 到 product_img
   const imageModule = new ImageModule({
     centered: true,
     fileType: "docx",
@@ -467,13 +400,12 @@ async function renderDocxFromTemplate(templateAbsPath: string, data: Record<stri
       return TRANSPARENT_1X1_PNG;
     },
     getSize: (img: Buffer) => {
-      // 控制最大宽度（像素）
       const dim = sizeOf(img) || {};
       const w0 = Number(dim.width || 260);
       const h0 = Number(dim.height || 200);
       const maxW = 260;
       const w = Math.min(w0, maxW);
-      const h = Math.round((h0 * w) / w0);
+      const h = Math.round((h0 * w) / (w0 || maxW));
       return [w, h];
     },
   });
@@ -529,6 +461,34 @@ async function uploadFileToBitable(appToken: string, buf: Buffer, fileName: stri
   return fileToken as string;
 }
 
+// -------------------- optional pdf (minimal) --------------------
+async function getLaunchOptions() {
+  const isVercel = !!process.env.VERCEL || !!process.env.AWS_LAMBDA_FUNCTION_VERSION;
+  if (isVercel) {
+    return { args: chromium.args, executablePath: await chromium.executablePath(), headless: true };
+  }
+  const macChrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+  return {
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || (process.platform === "darwin" ? macChrome : undefined),
+    headless: true,
+  };
+}
+
+async function htmlToPdfBuffer(html: string) {
+  const launchOpt = await getLaunchOptions();
+  const browser = await puppeteer.launch(launchOpt as any);
+  try {
+    const page = await browser.newPage();
+    page.setDefaultNavigationTimeout(60_000);
+    await page.setContent(html, { waitUntil: "domcontentloaded" });
+    const pdf = await page.pdf({ format: "A4", printBackground: true });
+    return Buffer.from(pdf);
+  } finally {
+    await browser.close();
+  }
+}
+
 // -------------------- main handler --------------------
 export default async function handler(req: any, res: any) {
   try {
@@ -537,7 +497,7 @@ export default async function handler(req: any, res: any) {
       return;
     }
 
-    // 简单鉴权
+    // 简单鉴权：可选
     const token = process.env.WEBHOOK_TOKEN;
     if (token) {
       const got = (req.headers["x-webhook-token"] as string | undefined) || (req.headers["X-Webhook-Token"] as any);
@@ -550,6 +510,7 @@ export default async function handler(req: any, res: any) {
     const body = await readJson(req);
     const recordId = body?.record_id || body?.recordId;
     const format = String(body?.format || "docx").toLowerCase();
+
     if (!recordId) {
       res.status(400).json({ ok: false, error: "Missing record_id" });
       return;
@@ -560,59 +521,34 @@ export default async function handler(req: any, res: any) {
     const attachmentField = process.env.FEISHU_CONTRACT_ATTACHMENT_FIELD || "合同附件";
     if (!appToken || !tableId) throw new Error("Missing FEISHU_APP_TOKEN / FEISHU_CONTRACT_TABLE_ID");
 
-    // 拉取合同记录
+    // 1) 拉取合同记录
     const rec = await feishuFetch(
       `/bitable/v1/apps/${encodeURIComponent(appToken)}/tables/${encodeURIComponent(tableId)}/records/${encodeURIComponent(recordId)}`,
       { method: "GET" }
     );
+
     const fields = rec?.data?.record?.fields || {};
-        // ===== DEBUG 开关：飞书请求里带 debug:true 才打印 =====
-    const debug = !!body?.debug;
-    const j = (x: any) => {
-      try { return JSON.stringify(x); } catch { return String(x); }
-    };
-    const log = (...args: any[]) => { if (debug) console.log(...args); };
-    
-    // 打印这条记录有哪些字段名（最关键）
-    log("FIELDS_KEYS:", Object.keys(fields));
-    
-    // 打印我们关心的3个原始字段结构
-    const _payRaw = pickFieldLoose(fields, ["付款条件"]);
-    const _tailRaw = pickFieldLoose(fields, ["尾款条件"]);
-    const _imgRaw = pickFieldLoose(fields, [process.env.FEISHU_PRODUCT_IMAGE_FIELD || "产品图", "产品图片", "产品主图", "参考图", "图片"]);
-    
-    log("payCondRaw:", j(_payRaw).slice(0, 2000));
-    log("tailCondRaw:", j(_tailRaw).slice(0, 2000));
-    log("imgRaw:", j(_imgRaw).slice(0, 2000));
-    
-    // 如果是“引用/关联”，看看是不是 record_ids 结构
-    log("payLinks:", j(extractLinkItems(_payRaw)));
-    log("tailLinks:", j(extractLinkItems(_tailRaw)));
-    log("imgLinks:", j(extractLinkItems(_imgRaw)));
 
-    // ===================== 付款条件/尾款条件（引用/查找引用）=====================
+    // ===================== 付款条件 / 尾款条件（引用兜底解析）=====================
     const payCondRaw = pickFieldLoose(fields, ["付款条件"]);
-    let paymentTerms = extractReadableText(payCondRaw);
-    if (!paymentTerms || looksLikeId(paymentTerms)) {
-      const links = extractLinkItems(payCondRaw);
-      if (links.length) {
-        paymentTerms = await resolveTextFromLinkedRecords(appToken, links, ["规则名称", "条款名称", "名称", "标题", "文本", "付款条件"]);
-      }
-    }
-    paymentTerms = paymentTerms || "";
-
     const tailCondRaw = pickFieldLoose(fields, ["尾款条件"]);
-    let tailPay = extractReadableText(tailCondRaw);
-    if (!tailPay || looksLikeId(tailPay)) {
-      const links = extractLinkItems(tailCondRaw);
-      if (links.length) {
-        tailPay = await resolveTextFromLinkedRecords(appToken, links, ["规则名称", "条款名称", "名称", "标题", "文本", "尾款条件"]);
-      }
-    }
-    tailPay = tailPay || "";
-    // ===================== /付款条件/尾款条件 =====================
 
-    // 合同基础字段
+    const paymentTerms = await resolveLinkedText(appToken, payCondRaw, ["预付", "无预付", "N+", "%", "账期"]);
+    const tailPay = await resolveLinkedText(appToken, tailCondRaw, ["出货", "月", "付清", "尾款", "N+"]);
+
+    // ===================== 产品图（引用图片）=====================
+    const contractImageField = process.env.FEISHU_PRODUCT_IMAGE_FIELD || "产品图";
+    const imgRaw = pickFieldLoose(fields, [contractImageField, "产品图片", "产品主图", "参考图", "图片"]);
+    let imgToken = await resolveImageToken(appToken, imgRaw);
+
+    // 如果合同图没拿到，再尝试从 SKU 引用里拿
+    const skuLinkField = process.env.FEISHU_SKU_LINK_FIELD || "SKU";
+    const skuVal = pickFieldLoose(fields, [skuLinkField, "产品SKU", "产品SKU/规格"]);
+    if (!imgToken) {
+      imgToken = await resolveImageToken(appToken, skuVal);
+    }
+
+    // ===================== 其他字段 =====================
     const contractNo = toText(pickFieldLoose(fields, ["合同号", "合同编号"]) || "");
     const sku = toText(pickFieldLoose(fields, ["产品SKU", "SKU", "型号/规格"]) || "");
     const productName = toText(pickFieldLoose(fields, ["产品名称", "品名"]) || "");
@@ -639,36 +575,23 @@ export default async function handler(req: any, res: any) {
     const signDateRaw = pickFieldLoose(fields, ["签订日期"]);
     const signDate = signDateRaw ? fmtDateCn(signDateRaw) : fmtDateCn(Date.now());
 
-    // ===================== 产品图（引用图片）& 数量单位（来自 SKU 主档） =====================
-    const contractImageField = process.env.FEISHU_PRODUCT_IMAGE_FIELD || "产品图";
-    const skuLinkField = process.env.FEISHU_SKU_LINK_FIELD || "SKU";
-    const skuImageField = process.env.FEISHU_SKU_IMAGE_FIELD || "产品图";
+    // 数量单位：如果你有 SKU 主档的“数量单位”引用，也可以继续扩展；这里默认台
+    const qtyUnit = "台";
 
-    const skuVal = pickFieldLoose(fields, [skuLinkField, "产品SKU", "产品SKU/规格"]);
+    // 预付款金额
+    const prepayText = toText(pickFieldLoose(fields, ["预付款金额", "预付款", "预付金额"]) || "");
+    const prepayNum = num(prepayText);
 
-    // 数量单位
-    let qtyUnit = "";
-    const skuLinksForUnit = extractLinkItems(skuVal);
-    if (skuLinksForUnit.length) {
-      qtyUnit = await resolveTextFromLinkedRecords(appToken, skuLinksForUnit, ["数量单位"]);
-    }
-    if (!qtyUnit) qtyUnit = "台";
-
-    // 取产品图 file_token：先合同记录自身字段，再顺着 SKU 主档
-    const imgVal = pickFieldLoose(fields, [contractImageField, "产品图片", "产品主图", "参考图", "图片"]);
-    let imgToken = pickFileToken(imgVal);
-
-    if (!imgToken) {
-      const skuLinks = extractLinkItems(skuVal);
-      if (skuLinks.length) {
-        imgToken = await resolveAttachmentFromLinkedRecords(appToken, skuLinks, [skuImageField, "产品图片", "主图", "图片", "参考图"]);
-      }
-    }
-
-    // ===================== 生成 docx（默认） =====================
+    // ===================== 生成文件 =====================
     if (format === "pdf") {
-      // 你如果还想保留 PDF，可自行补 html 内容；这里给一个极简 PDF 兜底
-      const html = `<html><body><h1>合同 ${contractNo}</h1><p>${productName}</p></body></html>`;
+      const html = `
+        <html><body style="font-family:Arial">
+          <h2>合同 ${contractNo}</h2>
+          <p>产品：${productName} / ${sku}</p>
+          <p>付款条件：${paymentTerms}</p>
+          <p>尾款条件：${tailPay}</p>
+        </body></html>
+      `;
       const pdf = await htmlToPdfBuffer(html);
 
       const safeContractNo = (contractNo || "合同").replace(/[\\/:*?"<>|]/g, "_");
@@ -686,17 +609,15 @@ export default async function handler(req: any, res: any) {
         }
       );
 
-      res.status(200).json({ ok: true, record_id: recordId, file_token: fileToken, file_name: fileName, format: "pdf" });
+      res.status(200).json({ ok: true, format: "pdf", file_name: fileName, file_token: fileToken, record_id: recordId });
       return;
     }
 
+    // ===== Word (docx) =====
     const templateName = process.env.CONTRACT_TEMPLATE_NAME || "采购合同_模板_变量版.docx";
     const templatePath = path.join(process.cwd(), "templates", templateName);
 
-    const prepayText = toText(pickFieldLoose(fields, ["预付款金额", "预付款", "预付金额"]) || "");
-    const prepayNum = num(prepayText);
-
-    // docx 图片：把 buffer 直接作为 product_img 变量传入
+    // 产品图 buffer
     const productImgBuf = imgToken ? await downloadMediaToBuffer(imgToken) : null;
 
     const docxBuf = await renderDocxFromTemplate(templatePath, {
@@ -720,20 +641,17 @@ export default async function handler(req: any, res: any) {
       采购总价: totalPrice,
       采购总价大写: (() => {
         const n = num(totalPrice);
-        return n ? rmbUppercase(n) : "";
+        return n ? String(n) : "";
       })(),
 
-      净重: toText(pickFieldLoose(fields, ["净重"]) || ""),
-      毛重: toText(pickFieldLoose(fields, ["毛重"]) || ""),
-      包装尺寸: toText(pickFieldLoose(fields, ["包装尺寸"]) || ""),
       产品备注: productRemark,
 
-      付款条件: paymentTerms,
-      预付款金额: prepayText,
-      预付款金额大写: prepayNum ? rmbUppercase(prepayNum) : "",
-      尾款条件: tailPay,
+      付款条件: paymentTerms || "",
+      预付款金额: prepayText || "",
+      预付款金额大写: prepayNum ? String(prepayNum) : "",
+      尾款条件: tailPay || "",
 
-      // 模板图片占位符：{%%product_img}
+      // 模板里要放 {%%product_img}
       product_img: productImgBuf || null,
     });
 
@@ -757,13 +675,9 @@ export default async function handler(req: any, res: any) {
       }
     );
 
-    res.status(200).json({ ok: true, record_id: recordId, file_token: fileToken, file_name: fileName, format: "docx" });
+    res.status(200).json({ ok: true, format: "docx", file_name: fileName, file_token: fileToken, record_id: recordId });
   } catch (e: any) {
     console.error(e);
-    res.status(500).json({
-      ok: false,
-      error: e?.message || String(e),
-      details: e?.properties?.errors?.map((x: any) => x?.properties?.explanation || x?.message || x) || null,
-    });
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 }
